@@ -39,7 +39,7 @@ PRESENTATION_SCRIPT_SCHEMA = {
             "subtitle": {"type": "string"},
             "theme": {
                 "type": "string",
-                "description": "Visual theme: modern-dark, modern-light, corporate-blue, warm-gradient, minimal-white, bold-color",
+                "description": "Visual theme: corporate-white (recommended — white bg with navy/red/green accents, NotebookLM style), modern-light, corporate-blue",
             },
             "slides": {
                 "type": "array",
@@ -139,9 +139,25 @@ class PresentationGenerator:
                 "image_count": len(section.images),
             })
 
-        prompt = f"""You are a world-class presentation designer. Create a professional slide deck 
-from this content. The slides should look like they were made by a top design agency — clean, 
-modern, visually striking with professional graphics and illustrations.
+        prompt = f"""You are a world-class presentation designer creating slides in the style of 
+Google NotebookLM / corporate training decks. The slides must look like professional infographics 
+with a CLEAN WHITE BACKGROUND, bold dark navy headlines, structured card layouts, flat vector 
+icons, and color-coded sections.
+
+REFERENCE STYLE (match this exactly):
+- WHITE or very light gray background — NOT dark themes
+- Bold dark navy (#1B2A4A) headlines in large sans-serif font
+- Smaller red (#C41E3A) section labels/pillar headers above the main headline
+- Content organized in CARD LAYOUTS: rounded-corner cards with thin borders arranged in rows
+- Each card has: a flat vector ICON at top, a navy header bar with white text, body text below
+- Color-coded accents: green (#2E7D32) for positive/required, red (#C41E3A) for warnings/prohibited
+- Checkmark (✓) and X (✗) icons for do/don't lists
+- Process flows shown as horizontal card sequences with arrow connections
+- Two-column comparison layouts with green "Must Have" vs red "Prohibited" headers
+- Flat vector silhouette icons (people, objects, symbols) — NOT photos, NOT 3D
+- Clean sans-serif typography (like Inter, Helvetica, or Segoe UI)
+- Generous whitespace, never overcrowded
+- Subtle drop shadows on cards for depth
 
 Title: {content.title}
 Source: {content.source_type}
@@ -152,35 +168,43 @@ Content:
 Create a presentation script as JSON. Design 7-12 slides that tell a compelling story.
 
 Slide types and when to use them:
-- "title" — opening slide with title + subtitle (always first)
-- "content" — standard content slide with headline, body text, and/or bullet points
-- "two_column" — side-by-side layout for comparisons or related points
-- "key_point" — large bold statement or key takeaway (use sparingly for impact)
-- "quote" — featured quote or important callout
-- "data" — data visualization, statistics, or metrics display
-- "section_break" — transition slide between major sections (short headline only)
-- "closing" — final slide with summary or call to action (always last)
+- "title" — opening slide with title + subtitle on white background with a subtle accent graphic
+- "content" — standard content slide with headline and bullet points in card layout
+- "two_column" — side-by-side comparison cards (e.g., "Must Have" vs "Prohibited", "Before" vs "After")
+- "key_point" — large bold statement centered, with a supporting icon or graphic
+- "quote" — featured quote or important policy callout in a styled card
+- "data" — process flow, timeline, or metrics displayed as connected cards with icons
+- "section_break" — pillar/section transition with section number and title
+- "closing" — final slide with summary checklist or call to action
 
 For each slide:
 - headline: concise, impactful (3-8 words)
-- body_text: supporting text (1-3 sentences, can be empty for some types)
-- bullet_points: key points as short phrases (3-5 bullets max, can be empty)
-- narration: what a presenter would say about this slide (2-4 sentences, conversational)
-- visual_description: DETAILED description of graphics/illustrations to generate.
-  Be specific about icons, diagrams, illustrations, charts, infographics.
-  Example: "A modern flat illustration of a team collaborating around a digital dashboard, 
-  with floating data cards and a gradient blue-to-purple background"
-- color_accent: hex color that fits the slide mood (vary across slides for visual interest)
+- body_text: supporting text (1-2 sentences, can be empty)
+- bullet_points: key points as SHORT phrases (3-5 max, can be empty)
+- narration: what a presenter would say (2-4 sentences, conversational)
+- visual_description: EXTREMELY DETAILED layout description for the image generator.
+  Describe the EXACT layout: how many cards, what icons, what colors, what text goes where.
+  Examples:
+  - "White background. Three rounded-corner cards arranged horizontally. Each card has a flat 
+    vector icon at top (calendar icon, warning triangle icon, medical cross icon), a dark navy 
+    header bar with white text, and body text below. Cards connected by subtle arrow lines."
+  - "White background. Two-column layout. Left column has green header bar reading 'Must Have' 
+    with checkmark icons and bullet points. Right column has red header bar reading 'Prohibited' 
+    with X icons and bullet points. Flat vector silhouette illustrations in each column."
+  - "White background. Large bold headline at top. Below: four metric cards in a row, each 
+    showing a large number, a label, and a small icon. Color-coded borders."
+- color_accent: hex color for this slide's accent (navy #1B2A4A, red #C41E3A, green #2E7D32, blue #1565C0)
 
-Theme options: modern-dark, modern-light, corporate-blue, warm-gradient, minimal-white, bold-color
-Pick the theme that best fits the content.
+Theme: always use "corporate-white" — white backgrounds with navy/red/green accents.
 
 Guidelines:
-- Every slide MUST have a rich visual_description — these will be generated as actual graphics
-- Think like Apple Keynote or Google I/O presentations — bold, clean, visual-first
+- Every slide MUST have an extremely detailed visual_description with specific layout instructions
+- Think Google NotebookLM slides or corporate training decks — NOT dark tech themes
 - Bullet points should be SHORT phrases, not sentences
-- Vary slide types for visual rhythm (don't use 5 content slides in a row)
-- Data slides should describe charts/infographics in visual_description
+- Vary slide types for visual rhythm
+- Use process flows (horizontal card sequences) for procedures and timelines
+- Use two-column comparisons for do/don't, before/after, required/prohibited
+- Use icon+card layouts for categorized information
 - The narration should flow naturally as a spoken presentation
 
 Return ONLY valid JSON."""
@@ -222,7 +246,7 @@ Return ONLY valid JSON."""
         script = PresentationScript(
             title=data["title"],
             subtitle=data.get("subtitle", ""),
-            theme=data.get("theme", "modern-dark"),
+            theme=data.get("theme", "corporate-white"),
             slides=slides,
         )
 
@@ -250,28 +274,43 @@ Return ONLY valid JSON."""
         if slide.body_text:
             body_section = f"\nBody text on the slide: {slide.body_text}"
 
-        prompt = f"""Create a professional presentation slide image. This should look like a 
-high-end keynote or pitch deck slide — clean typography, modern design, professional graphics.
+        prompt = f"""Create a professional presentation slide image in the style of Google NotebookLM 
+or a corporate training deck. This must look like a real, polished infographic slide.
 
-SLIDE DETAILS:
-- Presentation title: {title}
-- Theme style: {theme}
+EXACT STYLE TO MATCH:
+- CLEAN WHITE or very light gray (#F8F9FA) background — NOT dark
+- Bold dark navy (#1B2A4A) headline text, large sans-serif font at the top
+- If there's a section label, it goes ABOVE the headline in smaller red (#C41E3A) text
+- Content organized in ROUNDED-CORNER CARDS with thin gray borders and subtle drop shadows
+- Cards have: colored header bars (navy, green, or red) with white text, then body content below
+- FLAT VECTOR ICONS — simple, clean silhouette-style (NOT 3D, NOT photographic)
+- Color coding: green (#2E7D32) = positive/required, red (#C41E3A) = warning/prohibited, 
+  navy (#1B2A4A) = neutral/informational, blue (#1565C0) = highlights
+- Checkmark icons (✓) in green circles for positive items
+- X icons (✗) in red for prohibited items  
+- Clean sans-serif typography throughout (like Inter, Helvetica, or Segoe UI)
+- Generous whitespace between elements
+- Professional, corporate, training-deck aesthetic
+
+SLIDE CONTENT:
+- Presentation: {title}
 - Slide type: {slide.slide_type}
-- Headline text on slide: {slide.headline}{body_section}{bullet_text}
+- Headline: {slide.headline}{body_section}{bullet_text}
 - Accent color: {slide.color_accent}
-- Visual elements: {slide.visual_description}
 
-DESIGN REQUIREMENTS:
-- 16:9 aspect ratio (1920x1080 landscape)
-- Clean, modern typography — headline should be large and bold
-- Professional color scheme with the accent color as a highlight
-- Include the actual text (headline, bullets) rendered beautifully on the slide
-- Include professional graphics, icons, or illustrations as described
-- NO stock photo watermarks, NO placeholder text
-- The slide should look like it was designed by a professional agency
-- Consistent with a {theme} visual theme
-- High contrast, readable text
-- Generous whitespace — don't overcrowd"""
+LAYOUT & VISUAL ELEMENTS:
+{slide.visual_description}
+
+CRITICAL REQUIREMENTS:
+- 16:9 landscape aspect ratio (1920x1080)
+- WHITE background — this is non-negotiable
+- All text on the slide must be READABLE and properly rendered
+- Include the headline, body text, and bullet points as actual text on the slide
+- Use flat vector icons and illustrations, NOT photographs
+- Cards should have rounded corners, thin borders, subtle shadows
+- The slide must look like it came from a professional corporate presentation
+- NO watermarks, NO placeholder text, NO lorem ipsum
+- Match the clean, structured, infographic style of Google NotebookLM slides"""
 
         response = _retry(lambda: self.client.images.generate(
             model=Config.OPENAI_IMAGE_MODEL,
