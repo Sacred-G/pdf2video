@@ -38,14 +38,13 @@ def _run_pipeline_sync(
     Imports core/ modules here to keep them isolated from async context.
     """
     from core.config import Config
-    from core.content_input import content_from_pdf, content_from_text_and_images
-    from core.pipeline import PDF2VideoPipeline
 
     # Apply per-job settings to core Config
     voice = job_settings.get("voice", "onyx")
     resolution = job_settings.get("resolution", "1920x1080")
     fps = job_settings.get("fps", 30)
     generate_backgrounds = job_settings.get("generate_backgrounds", True)
+    output_mode = job_settings.get("output_mode", "video")
 
     w, h = (int(x) for x in resolution.split("x"))
     Config.VIDEO_WIDTH = w
@@ -62,6 +61,10 @@ def _run_pipeline_sync(
         "Generating AI backgrounds": "backgrounds",
         "Composing video": "composing",
         "Exporting video": "exporting",
+        "Planning slides": "scripting",
+        "Generating slides": "composing",
+        "Assembling PDF": "exporting",
+        "Composing presentation": "composing",
     }
 
     def on_progress(step: str, pct: float):
@@ -71,6 +74,28 @@ def _run_pipeline_sync(
                 status = s
                 break
         progress_manager.update(job_id, status, step, pct)
+
+    # ── Presentation Mode ─────────────────────────────────
+    if output_mode in ("presentation", "both"):
+        from core.presentation import PresentationPipeline
+
+        pres_pipeline = PresentationPipeline()
+        result = pres_pipeline.run(
+            pdf_path=pdf_path,
+            text_content=text_content,
+            title=title,
+            output_dir=output_dir,
+            voice=voice,
+            generate_video=True,
+            generate_pdf=True,
+            progress_callback=on_progress,
+        )
+        # Return the video path (PDF is also saved in output_dir)
+        return result.video_path or result.pdf_path
+
+    # ── Standard Video Mode ───────────────────────────────
+    from core.content_input import content_from_pdf, content_from_text_and_images
+    from core.pipeline import PDF2VideoPipeline
 
     pipeline = PDF2VideoPipeline()
     output_path = output_dir / f"{job_id}.mp4"

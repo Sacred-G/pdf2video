@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { ArrowRight, Loader2, Save, FolderOpen } from "lucide-react";
+import { ArrowRight, Loader2, Save, FolderOpen, Film, Presentation, Layers } from "lucide-react";
 import { toast } from "sonner";
 
 import { fpsOptions, resolutions, voices } from "@/lib/constants";
@@ -47,6 +47,7 @@ export function JobCreateForm() {
   const [fps, setFps] = useState(fpsOptions[1]); // 30
   const [generateBackgrounds, setGenerateBackgrounds] = useState(true);
   const [musicFile, setMusicFile] = useState<File | null>(null);
+  const [outputMode, setOutputMode] = useState<"video" | "presentation" | "both">("video");
 
   // Auto-load default preset on mount
   useEffect(() => {
@@ -133,6 +134,7 @@ export function JobCreateForm() {
             resolution,
             fps,
             generate_backgrounds: generateBackgrounds,
+            output_mode: outputMode,
           },
         }),
       });
@@ -183,6 +185,33 @@ export function JobCreateForm() {
 
         {step === 1 ? (
           <div className="space-y-4">
+            {/* Output mode selector */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-cyan-100/80">Output Mode</label>
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  { value: "video" as const, label: "Video", icon: Film, desc: "Cinematic video with effects" },
+                  { value: "presentation" as const, label: "Presentation", icon: Presentation, desc: "AI slide deck + video" },
+                  { value: "both" as const, label: "Both", icon: Layers, desc: "Video + presentation deck" },
+                ].map((mode) => (
+                  <button
+                    key={mode.value}
+                    type="button"
+                    onClick={() => setOutputMode(mode.value)}
+                    className={`surface flex flex-col items-center gap-1.5 rounded-xl p-3 text-center transition-all ${
+                      outputMode === mode.value
+                        ? "ring-2 ring-cyan-300/60 bg-cyan-300/10"
+                        : "hover:bg-cyan-300/5"
+                    }`}
+                  >
+                    <mode.icon className={`h-5 w-5 ${outputMode === mode.value ? "text-cyan-300" : "text-cyan-100/50"}`} />
+                    <span className={`text-sm font-medium ${outputMode === mode.value ? "text-cyan-50" : "text-cyan-100/70"}`}>{mode.label}</span>
+                    <span className="text-xs text-cyan-100/40">{mode.desc}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
             {/* Preset selector */}
             {presets.length > 0 && (
               <div className="flex items-center gap-2">
@@ -265,8 +294,9 @@ export function JobCreateForm() {
             <div className="space-y-1 text-sm text-cyan-100/70">
               <p><strong className="text-cyan-50">Source:</strong> {sourceType === "pdf" ? `PDF — ${pdfFile?.name}` : `Text + ${imageFiles.length} images`}</p>
               <p><strong className="text-cyan-50">Voice:</strong> {voice} · <strong className="text-cyan-50">Resolution:</strong> {resolution} · <strong className="text-cyan-50">FPS:</strong> {fps}</p>
+              <p><strong className="text-cyan-50">Mode:</strong> {outputMode === "video" ? "Cinematic Video" : outputMode === "presentation" ? "AI Presentation" : "Both"}</p>
               <p><strong className="text-cyan-50">AI Backgrounds:</strong> {generateBackgrounds ? "Yes" : "No"}{musicFile ? ` · Music: ${musicFile.name}` : ""}</p>
-              <p>Estimated render time: 5-8 minutes · GPU accelerated</p>
+              <p>Estimated render time: {outputMode === "presentation" ? "3-5 minutes" : "5-8 minutes"} · GPU accelerated</p>
             </div>
             <button
               onClick={handleSubmit}
@@ -274,7 +304,7 @@ export function JobCreateForm() {
               className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-teal-300 to-orange-300 px-4 py-2 font-semibold text-slate-950 disabled:opacity-50"
             >
               {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
-              {submitting ? "Uploading & Creating..." : "Generate Video"}
+              {submitting ? "Uploading & Creating..." : outputMode === "presentation" ? "Generate Presentation" : outputMode === "both" ? "Generate Both" : "Generate Video"}
             </button>
           </div>
         ) : null}

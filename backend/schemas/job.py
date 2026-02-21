@@ -10,6 +10,7 @@ class JobSettings(BaseModel):
     resolution: str = "1920x1080"
     fps: int = 30
     generate_backgrounds: bool = True
+    output_mode: str = "video"  # "video" | "presentation" | "both"
 
 
 class JobCreate(BaseModel):

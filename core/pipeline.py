@@ -267,9 +267,9 @@ def main():
     """Command-line interface."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Convert PDF to cinematic video")
+    parser = argparse.ArgumentParser(description="Convert PDF to cinematic video or presentation")
     parser.add_argument("pdf", help="Path to input PDF file")
-    parser.add_argument("-o", "--output", help="Output video path")
+    parser.add_argument("-o", "--output", help="Output path (video or directory)")
     parser.add_argument("-m", "--music", help="Background music file path")
     parser.add_argument(
         "-v", "--voice",
@@ -282,17 +282,34 @@ def main():
         action="store_true",
         help="Skip AI background generation (faster, cheaper)",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["video", "presentation", "both"],
+        default="video",
+        help="Output mode: video (cinematic), presentation (AI slide deck), or both",
+    )
 
     args = parser.parse_args()
 
-    pipeline = PDF2VideoPipeline()
-    pipeline.run(
-        pdf_path=args.pdf,
-        output_path=args.output,
-        background_music=args.music,
-        voice=args.voice,
-        generate_backgrounds=not args.no_backgrounds,
-    )
+    if args.mode in ("presentation", "both"):
+        from .presentation import PresentationPipeline
+        pres = PresentationPipeline()
+        pres.run(
+            pdf_path=args.pdf,
+            output_dir=args.output or str(Config.OUTPUT_DIR),
+            voice=args.voice,
+            generate_video=True,
+            generate_pdf=True,
+        )
+    else:
+        pipeline = PDF2VideoPipeline()
+        pipeline.run(
+            pdf_path=args.pdf,
+            output_path=args.output,
+            background_music=args.music,
+            voice=args.voice,
+            generate_backgrounds=not args.no_backgrounds,
+        )
 
 
 if __name__ == "__main__":
