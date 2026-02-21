@@ -7,8 +7,8 @@ from pydantic import BaseModel
 
 class JobSettings(BaseModel):
     voice: str = "onyx"
-    resolution: str = "1920x1080"
-    fps: int = 30
+    resolution: str = "1280x720"
+    fps: int = 24
     generate_backgrounds: bool = True
     output_mode: str = "video"  # "video" | "presentation" | "both"
 

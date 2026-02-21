@@ -4,45 +4,23 @@ Handles scene rendering, audio synchronization, transitions, and
 GPU-accelerated export via NVENC on RTX 5090.
 """
 
-import multiprocessing as mp
 import os
-import random
 import subprocess
-import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from moviepy import (
     AudioFileClip,
-    CompositeVideoClip,
-    ImageClip,
     VideoClip,
     concatenate_videoclips,
     vfx,
 )
 from rich.console import Console
-from tqdm import tqdm
 
 from .ai_services import SceneScript, VideoScript
 from .config import Config
 from .content_input import ContentImage, ContentInput
-from .effects import (
-    apply_vignette,
-    black_frame,
-    color_grade,
-    crossfade,
-    fit_image_to_frame,
-    ken_burns_frame,
-    render_callout_overlay,
-    render_logo_watermark,
-    render_picture_in_picture,
-    render_split_screen,
-    render_table_card,
-    render_text_overlay,
-    text_opacity_at_time,
-)
 
 console = Console()
 
@@ -73,22 +51,16 @@ class VideoComposer:
         final_video: VideoClip | None = None
 
         try:
-            # Gather logo images once for watermark use across all scenes
-            logo_images = self._gather_logo_images(content)
-            if logo_images:
-                console.print(f"  🏷️  {len(logo_images)} logo(s) will be used as watermarks")
-
-            # 1. Build scene clips
+            # 1. Build scene clips (exact PDF slides, static)
             for i, scene in enumerate(script.scenes):
-                layout_tag = f" [{scene.layout_mode}]" if scene.layout_mode != "single" else ""
-                console.print(f"  Rendering scene {scene.scene_number}/{len(script.scenes)}{layout_tag}...")
+                console.print(f"  Rendering scene {scene.scene_number}/{len(script.scenes)}...")
                 audio_path = audio_paths[i] if i < len(audio_paths) else None
                 clip = self._build_scene_clip(
                     scene=scene,
                     content=content,
                     audio_path=audio_path,
-                    ai_background=ai_backgrounds.get(scene.scene_number),
-                    logo_images=logo_images,
+                    ai_background=None,
+                    logo_images=None,
                 )
                 scene_clips.append(clip)
 
@@ -148,225 +120,62 @@ class VideoComposer:
         ai_background: Path | None,
         logo_images: list[ContentImage] | None = None,
     ) -> VideoClip:
-        """Build a complete scene clip with classification-aware composition.
-        Routes through layout modes: single, carousel, split_screen, picture_in_picture.
-        Applies classification-specific rendering (table cards, chart callouts, logo watermarks)."""
+        """Build a scene clip showing the exact PDF slide image, static, with audio."""
 
         # Determine scene duration from audio
         duration = scene.duration_hint
         audio_clip = None
         if audio_path and audio_path.exists():
             audio_clip = AudioFileClip(str(audio_path))
-            duration = audio_clip.duration + 0.5  # small padding
+            duration = audio_clip.duration + 0.5
             duration = max(duration, Config.MIN_SCENE_DURATION)
 
-        # Gather visual assets for this scene (as ContentImage with classification)
-        visuals = self._gather_scene_visuals(scene, content, ai_background)
+        # Get the first uploaded image for this scene (the PDF slide)
+        slide_image = None
+        for img_idx in scene.use_uploaded_images:
+            if 0 <= img_idx < len(content.all_images):
+                slide_image = content.all_images[img_idx].image
+                break
 
-        if not visuals:
-            visuals = [ContentImage(
-                image=Image.new("RGB", self.size, (20, 20, 30)),
-                classification="decorative",
-            )]
+        # Fallback: try section images from source pages
+        if slide_image is None:
+            for section_num in scene.source_pages:
+                if 1 <= section_num <= len(content.sections):
+                    section = content.sections[section_num - 1]
+                    if section.images:
+                        slide_image = section.images[0].image
+                        break
 
-        # Separate visuals by classification for smart composition
-        tables = [v for v in visuals if v.classification == "table"]
-        charts_diagrams = [v for v in visuals if v.classification in ("chart", "diagram")]
-        photos = [v for v in visuals if v.is_full_bleed]
-        data_visuals = [v for v in visuals if v.is_data_visual]
+        # Final fallback: dark background
+        if slide_image is None:
+            slide_image = Image.new("RGB", self.size, (20, 20, 30))
 
-        # Determine effective layout mode
-        layout = scene.layout_mode
-        # Auto-correct layout if visuals don't support it
-        if layout == "split_screen" and len(visuals) < 2:
-            layout = "single"
-        if layout == "carousel" and len(visuals) < 2:
-            layout = "single"
+        # Fit the slide to the frame (no overscan — exact fit)
+        fw, fh = self.size
+        img = slide_image.copy()
+        img_ratio = img.width / img.height
+        frame_ratio = fw / fh
 
-        # Prepare images for Ken Burns (non-table, non-logo visuals)
-        kb_visuals = [v for v in visuals if v.classification != "table"]
-        if not kb_visuals:
-            kb_visuals = visuals  # fallback
+        if img_ratio > frame_ratio:
+            new_w = fw
+            new_h = int(fw / img_ratio)
+        else:
+            new_h = fh
+            new_w = int(fh * img_ratio)
 
-        kb_images = [fit_image_to_frame(v.image, self.size, overscan=1.35) for v in kb_visuals]
-        num_visuals = len(kb_images)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
 
-        # Generate unique Ken Burns params per visual
-        kb_params = []
-        for v in kb_visuals:
-            if v.is_data_visual:
-                # Charts/diagrams: slow zoom in, minimal pan (focus on content)
-                kb_params.append({
-                    "zoom_start": 1.0,
-                    "zoom_end": 1.12,
-                    "pan_x": random.uniform(-0.02, 0.02),
-                    "pan_y": random.uniform(-0.02, 0.02),
-                })
-            else:
-                # Photos/decorative: standard cinematic Ken Burns
-                zs = random.uniform(1.0, 1.1)
-                ze = random.uniform(1.15, 1.3)
-                if random.random() > 0.5:
-                    zs, ze = ze, zs
-                kb_params.append({
-                    "zoom_start": zs,
-                    "zoom_end": ze,
-                    "pan_x": random.uniform(-Config.KB_PAN_MAX, Config.KB_PAN_MAX),
-                    "pan_y": random.uniform(-Config.KB_PAN_MAX, Config.KB_PAN_MAX),
-                })
+        # Center on black background
+        bg = Image.new("RGB", (fw, fh), (0, 0, 0))
+        x_offset = (fw - new_w) // 2
+        y_offset = (fh - new_h) // 2
+        bg.paste(img, (x_offset, y_offset))
 
-        # Build frame generator based on layout mode
-        narration_text = scene.narration
-        scene_dur = duration
-        xfade = min(Config.CAROUSEL_CROSSFADE_DURATION,
-                     scene_dur / (num_visuals * 4)) if num_visuals > 1 else 0
-        logo_list = logo_images or []
-
-        # For PiP: identify the background and inset
-        pip_bg_idx = 0
-        pip_inset_ci = None
-        if layout == "picture_in_picture" and len(visuals) >= 1:
-            # Background = AI-generated or first photo; inset = first chart/diagram/figure
-            bg_candidates = [i for i, v in enumerate(kb_visuals) if v.source == "ai_generated" or v.is_full_bleed]
-            inset_candidates = [v for v in visuals if v.is_data_visual]
-            if bg_candidates:
-                pip_bg_idx = bg_candidates[0]
-            if inset_candidates:
-                pip_inset_ci = inset_candidates[0]
-            elif visuals:
-                # Fallback: use first non-background visual as inset
-                non_bg = [v for v in visuals if v.source != "ai_generated"]
-                if non_bg:
-                    pip_inset_ci = non_bg[0]
-
-        # For split-screen: identify left and right
-        split_left_idx = 0
-        split_right_idx = min(1, num_visuals - 1)
+        # Convert to numpy array once (static frame)
+        static_frame = np.array(bg)
 
         def make_frame(t):
-            progress = t / scene_dur if scene_dur > 0 else 0
-
-            # ── Layout: Single ──────────────────────────────
-            if layout == "single":
-                # Check if the primary visual is a table → render as card
-                if tables and kb_visuals[0].classification == "table":
-                    frame = render_table_card(tables[0].image, self.size)
-                else:
-                    p = kb_params[0]
-                    frame = ken_burns_frame(
-                        kb_images[0], progress, self.size, **p,
-                    )
-
-            # ── Layout: Carousel ────────────────────────────
-            elif layout == "carousel":
-                segment_dur = scene_dur / num_visuals
-                raw_idx = t / segment_dur
-                idx_a = int(raw_idx) % num_visuals
-                idx_b = (idx_a + 1) % num_visuals
-                local_t = raw_idx - int(raw_idx)
-                local_progress = local_t
-
-                # Check if current visual is a table
-                if kb_visuals[idx_a].classification == "table":
-                    frame_a = render_table_card(kb_visuals[idx_a].image, self.size)
-                else:
-                    frame_a = ken_burns_frame(
-                        kb_images[idx_a], local_progress, self.size, **kb_params[idx_a],
-                    )
-
-                # Crossfade zone at end of each segment
-                xfade_start = 1.0 - (xfade / segment_dur) if segment_dur > 0 else 1.0
-                if local_t >= xfade_start and idx_b != idx_a:
-                    blend = (local_t - xfade_start) / (1.0 - xfade_start) if xfade_start < 1.0 else 0
-                    if kb_visuals[idx_b].classification == "table":
-                        frame_b = render_table_card(kb_visuals[idx_b].image, self.size)
-                    else:
-                        frame_b = ken_burns_frame(
-                            kb_images[idx_b], 0.0, self.size, **kb_params[idx_b],
-                        )
-                    frame = crossfade(frame_a, frame_b, blend)
-                else:
-                    frame = frame_a
-
-            # ── Layout: Split Screen ────────────────────────
-            elif layout == "split_screen":
-                p_left = kb_params[split_left_idx]
-                p_right = kb_params[split_right_idx]
-                frame_left = ken_burns_frame(
-                    kb_images[split_left_idx], progress, self.size, **p_left,
-                )
-                frame_right = ken_burns_frame(
-                    kb_images[split_right_idx], progress, self.size, **p_right,
-                )
-                frame = render_split_screen(frame_left, frame_right, self.size)
-
-            # ── Layout: Picture-in-Picture ──────────────────
-            elif layout == "picture_in_picture":
-                p = kb_params[pip_bg_idx]
-                bg_frame = ken_burns_frame(
-                    kb_images[pip_bg_idx], progress, self.size, **p,
-                )
-                if pip_inset_ci is not None:
-                    frame = render_picture_in_picture(
-                        bg_frame, pip_inset_ci.image, self.size,
-                    )
-                else:
-                    frame = bg_frame
-
-            else:
-                # Fallback to single
-                p = kb_params[0]
-                frame = ken_burns_frame(
-                    kb_images[0], progress, self.size, **p,
-                )
-
-            # ── Post-processing (all layouts) ───────────────
-
-            # Color grading
-            frame = color_grade(frame, warmth=0.03, contrast=1.08)
-
-            # Vignette
-            frame = apply_vignette(frame, intensity=0.35)
-
-            # Logo watermark overlay
-            if logo_list:
-                frame = render_logo_watermark(frame, logo_list[0].image, self.size)
-
-            # Callout overlay for charts/diagrams (no lower-third text competing)
-            if charts_diagrams and layout != "picture_in_picture":
-                callout_text = self._extract_key_phrase(narration_text, max_words=8)
-                callout_opacity = text_opacity_at_time(
-                    t, scene_dur,
-                    fade_in=Config.TEXT_FADE_DURATION,
-                    fade_out=Config.TEXT_FADE_DURATION,
-                )
-                if callout_opacity > 0.05 and callout_text:
-                    frame = render_callout_overlay(
-                        frame, callout_text,
-                        position="upper_right",
-                        opacity=callout_opacity * 0.85,
-                    )
-            # Standard text overlay for photos/decorative (skip for charts — they get callouts)
-            elif not charts_diagrams or layout == "picture_in_picture":
-                text_opacity = text_opacity_at_time(
-                    t, scene_dur,
-                    fade_in=Config.TEXT_FADE_DURATION,
-                    fade_out=Config.TEXT_FADE_DURATION,
-                )
-                if text_opacity > 0.05 and narration_text:
-                    # Photos: no text overlay competing with full-bleed visuals
-                    if photos and len(photos) == len(visuals):
-                        pass  # pure photo scene — let visuals breathe
-                    else:
-                        display_text = self._extract_key_phrase(narration_text)
-                        frame = render_text_overlay(
-                            frame, display_text,
-                            position="lower_third",
-                            opacity=text_opacity * 0.85,
-                            font_size=38,
-                        )
-
-            return frame
+            return static_frame
 
         video_clip = VideoClip(make_frame, duration=duration).with_fps(self.fps)
 
@@ -380,36 +189,51 @@ class VideoComposer:
     def _build_title_card(
         self, text: str, duration: float = 3.5, is_intro: bool = True
     ) -> VideoClip:
-        """Build an animated title/outro card."""
+        """Build a simple title/outro card — dark background with centered text."""
+        fw, fh = self.size
 
-        # Create gradient background
-        bg = self._create_gradient_background()
-        bg_fitted = fit_image_to_frame(bg, self.size, overscan=1.15)
+        # Render text onto a dark background using PIL
+        bg = Image.new("RGB", (fw, fh), (20, 20, 30))
+        draw = ImageDraw.Draw(bg)
+
+        # Try to load a nice font, fall back to default
+        font_size = 42
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except OSError:
+            font = ImageFont.load_default()
+
+        # Word-wrap text to fit frame width
+        max_chars = max(20, fw // (font_size // 2))
+        words = text.split()
+        lines = []
+        current_line = ""
+        for word in words:
+            test = f"{current_line} {word}".strip()
+            if len(test) <= max_chars:
+                current_line = test
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+
+        # Draw centered text
+        line_height = font_size + 10
+        total_height = len(lines) * line_height
+        y_start = (fh - total_height) // 2
+        for i, line in enumerate(lines):
+            bbox = draw.textbbox((0, 0), line, font=font)
+            tw = bbox[2] - bbox[0]
+            x = (fw - tw) // 2
+            y = y_start + i * line_height
+            draw.text((x, y), line, fill=(255, 255, 255), font=font)
+
+        static_frame = np.array(bg)
 
         def make_frame(t):
-            progress = t / duration
-            frame = ken_burns_frame(
-                bg_fitted, progress, self.size,
-                zoom_start=1.0, zoom_end=1.08,
-            )
-            frame = color_grade(frame, warmth=0.02, contrast=1.05)
-            frame = apply_vignette(frame, intensity=0.5)
-
-            # Fade the text
-            if is_intro:
-                text_opacity = min(1, t / 1.0) * min(1, (duration - t) / 0.5)
-            else:
-                text_opacity = min(1, t / 0.5) * min(1, (duration - t) / 1.0)
-
-            if text_opacity > 0.05:
-                frame = render_text_overlay(
-                    frame, text,
-                    position="title",
-                    opacity=text_opacity,
-                    font_size=48,
-                )
-
-            return frame
+            return static_frame
 
         return VideoClip(make_frame, duration=duration).with_fps(self.fps)
 
@@ -555,151 +379,56 @@ class VideoComposer:
             console.print(f"[yellow]⚠ Background music error: {e}[/]")
             return video
 
-    # ── Parallel Frame Rendering + Export ──────────────────
+    # ── Video Export ────────────────────────────────────────
 
     def _export_gpu(self, video: VideoClip, output_path: Path):
         """
-        Export video with parallel frame rendering piped to ffmpeg.
-        Uses multiprocessing to render frames across all CPU cores,
-        then pipes raw RGB24 frames to ffmpeg (NVENC or libx264).
+        Export video using MoviePy's write_videofile with NVENC or libx264.
+        MoviePy handles FFmpeg I/O internally — no raw-frame pipe needed.
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         has_nvenc = self._check_nvenc()
-        render_workers = self._resolve_render_workers()
-        console.print(f"  Using {render_workers} parallel render workers")
-
-        w, h = self.size
-        total_frames = int(video.duration * self.fps)
-
-        # 1. Write audio to a temp file
-        audio_tmp = None
-        if video.audio is not None:
-            audio_tmp = tempfile.NamedTemporaryFile(
-                suffix=".aac", dir=Config.TEMP_DIR, delete=False
-            )
-            audio_tmp.close()
-            video.audio.write_audiofile(
-                audio_tmp.name, fps=44100, codec="aac",
-                bitrate="192k", logger=None,
-            )
-
-        # 2. Build ffmpeg command
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-s", f"{w}x{h}",
-            "-pix_fmt", "rgb24",
-            "-r", str(self.fps),
-            "-i", "pipe:0",
-        ]
-
-        if audio_tmp:
-            cmd.extend(["-i", audio_tmp.name, "-c:a", "aac", "-b:a", "192k"])
 
         if has_nvenc:
-            console.print("  [green]Encoding: NVIDIA NVENC (GPU)[/]")
-            cmd.extend([
-                "-c:v", "h264_nvenc",
-                "-preset", Config.NVENC_PRESET,
-                "-rc", "vbr",
-                "-cq", "19",
-                "-b:v", Config.VIDEO_BITRATE,
-                "-maxrate", "20M",
-                "-bufsize", "24M",
-                "-profile:v", "high",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
+            console.print("  [green]Encoding: HEVC NVENC (GPU)[/]")
+            video.write_videofile(
                 str(output_path),
-            ])
+                fps=self.fps,
+                codec="hevc_nvenc",
+                audio_codec="aac",
+                audio_bitrate="128k",
+                preset=Config.NVENC_PRESET,
+                bitrate=Config.VIDEO_BITRATE,
+                ffmpeg_params=[
+                    "-rc", "vbr",
+                    "-cq", "28",
+                    "-maxrate", "4M",
+                    "-bufsize", "8M",
+                    "-tag:v", "hvc1",
+                    "-movflags", "+faststart",
+                ],
+                threads=self._resolve_render_workers(),
+                logger="bar",
+            )
         else:
-            console.print("  [yellow]Encoding: libx264 (CPU)[/]")
-            cmd.extend([
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
+            console.print("  [yellow]Encoding: libx265 (CPU)[/]")
+            video.write_videofile(
                 str(output_path),
-            ])
-
-        # 3. Parallel render → pipe to ffmpeg
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        try:
-            self._parallel_render_to_pipe(video, proc.stdin, total_frames, render_workers)
-            proc.stdin.close()
-            proc.wait()
-
-            if proc.returncode != 0:
-                stderr = proc.stderr.read().decode() if proc.stderr else ""
-                raise RuntimeError(f"FFmpeg encode failed (rc={proc.returncode}): {stderr[:500]}")
-        except Exception:
-            proc.kill()
-            raise
-        finally:
-            if audio_tmp:
-                Path(audio_tmp.name).unlink(missing_ok=True)
-
-    def _parallel_render_to_pipe(
-        self,
-        video: VideoClip,
-        pipe,
-        total_frames: int,
-        num_workers: int,
-    ):
-        """
-        Render frames in parallel batches using multiprocessing,
-        then write them in order to the ffmpeg pipe.
-
-        Strategy: render in chunks of `num_workers` frames at a time.
-        Each chunk is rendered in parallel, then written sequentially
-        to maintain frame order for the encoder.
-        """
-        batch_size = num_workers * 4  # render 4 frames per worker per batch
-        fps = self.fps
-
-        with tqdm(total=total_frames, desc="  Rendering frames", unit="f") as pbar:
-            for batch_start in range(0, total_frames, batch_size):
-                batch_end = min(batch_start + batch_size, total_frames)
-                batch_indices = list(range(batch_start, batch_end))
-
-                # Render batch in parallel using get_frame
-                frames = [None] * len(batch_indices)
-
-                if num_workers <= 1 or len(batch_indices) <= 2:
-                    # Single-threaded fallback for tiny batches
-                    for i, idx in enumerate(batch_indices):
-                        t = idx / fps
-                        frame = video.get_frame(t)
-                        if frame.dtype != np.uint8:
-                            frame = np.clip(frame, 0, 255).astype(np.uint8)
-                        frames[i] = frame
-                else:
-                    # Parallel rendering using threads (ProcessPool can't pickle VideoClip)
-                    from concurrent.futures import ThreadPoolExecutor
-                    def _render_frame(idx):
-                        t = idx / fps
-                        frame = video.get_frame(t)
-                        if frame.dtype != np.uint8:
-                            frame = np.clip(frame, 0, 255).astype(np.uint8)
-                        return frame
-
-                    with ThreadPoolExecutor(max_workers=num_workers) as pool:
-                        future_map = {
-                            pool.submit(_render_frame, idx): i
-                            for i, idx in enumerate(batch_indices)
-                        }
-                        for future in as_completed(future_map):
-                            i = future_map[future]
-                            frames[i] = future.result()
-
-                # Write frames in order to pipe
-                for frame in frames:
-                    pipe.write(frame.tobytes())
-                pbar.update(len(batch_indices))
+                fps=self.fps,
+                codec="libx265",
+                audio_codec="aac",
+                audio_bitrate="128k",
+                preset="medium",
+                ffmpeg_params=[
+                    "-crf", "28",
+                    "-tag:v", "hvc1",
+                    "-movflags", "+faststart",
+                ],
+                threads=self._resolve_render_workers(),
+                logger="bar",
+            )
 
     def _check_nvenc(self) -> bool:
         """Check if NVIDIA NVENC encoder is available."""

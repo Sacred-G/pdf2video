@@ -26,11 +26,11 @@ class Config:
     OPENAI_IMAGE_MODEL: str = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 
     # ── Video Output ────────────────────────────────────────
-    VIDEO_WIDTH: int = int(os.getenv("VIDEO_WIDTH", "1920"))
-    VIDEO_HEIGHT: int = int(os.getenv("VIDEO_HEIGHT", "1080"))
-    VIDEO_FPS: int = int(os.getenv("VIDEO_FPS", "30"))
-    VIDEO_CODEC: str = os.getenv("VIDEO_CODEC", "h264_nvenc")
-    VIDEO_BITRATE: str = os.getenv("VIDEO_BITRATE", "12M")
+    VIDEO_WIDTH: int = int(os.getenv("VIDEO_WIDTH", "1280"))
+    VIDEO_HEIGHT: int = int(os.getenv("VIDEO_HEIGHT", "720"))
+    VIDEO_FPS: int = int(os.getenv("VIDEO_FPS", "24"))
+    VIDEO_CODEC: str = os.getenv("VIDEO_CODEC", "hevc_nvenc")
+    VIDEO_BITRATE: str = os.getenv("VIDEO_BITRATE", "2M")
     VIDEO_SIZE: tuple = (VIDEO_WIDTH, VIDEO_HEIGHT)
 
     # ── Scene Timing (seconds) ──────────────────────────────
@@ -66,7 +66,7 @@ class Config:
 
     # ── GPU / Performance ───────────────────────────────────
     # NVENC presets: p1(fastest) → p7(slowest/best quality)
-    NVENC_PRESET: str = "p5"
+    NVENC_PRESET: str = "p4"
     AUTO_TUNE_WORKERS: bool = _env_bool("AUTO_TUNE_WORKERS", True)
     # Number of threads for CPU-heavy render work.
     # Override with NUM_WORKERS env var when needed.
