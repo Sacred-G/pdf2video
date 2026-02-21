@@ -125,8 +125,11 @@ class PresentationGenerator:
 
     # ── Slide Planning (AI Script) ───────────────────────
 
-    def plan_slides(self, content: ContentInput) -> PresentationScript:
-        """Use AI to plan the slide deck structure and content."""
+    def plan_slides(
+        self, content: ContentInput, logo_image: Image.Image | None = None,
+    ) -> PresentationScript:
+        """Use AI to plan the slide deck structure and content.
+        If a logo_image is provided, it's sent to the AI so it can theme the design around it."""
         console.print("[bold blue]📋 Planning presentation slides with AI...[/]")
 
         # Build content summary
@@ -196,6 +199,11 @@ For each slide:
 - color_accent: hex color for this slide's accent (navy #1B2A4A, red #C41E3A, green #2E7D32, blue #1565C0)
 
 Theme: always use "corporate-white" — white backgrounds with navy/red/green accents.
+If a company logo image is provided below, study its colors, style, and branding to:
+- Extract the brand's primary and accent colors and use them throughout the slides
+- Include the logo on the TITLE slide (first slide) prominently
+- Use the logo as a small watermark in the corner of every other slide
+- Match the overall color scheme to the brand identity
 
 Guidelines:
 - Every slide MUST have an extremely detailed visual_description with specific layout instructions
@@ -211,6 +219,22 @@ Return ONLY valid JSON."""
 
         # Build multimodal input with image thumbnails if available
         input_content = [{"type": "input_text", "text": prompt}]
+
+        # Send logo image first so AI can theme around it
+        if logo_image is not None:
+            try:
+                logo_url = image_to_data_url(logo_image, max_size=512)
+                input_content.append({
+                    "type": "input_text",
+                    "text": "COMPANY LOGO — use this to theme the entire presentation. Extract brand colors and include this logo on the title slide and as a watermark on other slides:",
+                })
+                input_content.append({
+                    "type": "input_image",
+                    "image_url": logo_url,
+                })
+            except Exception as e:
+                console.print(f"  [yellow]⚠ Could not encode logo: {e}[/]")
+
         for i, ci in enumerate(content.all_images[:10]):  # cap at 10 images
             try:
                 data_url = image_to_data_url(ci.image, max_size=512)
@@ -259,7 +283,8 @@ Return ONLY valid JSON."""
     # ── Slide Image Generation (gpt-image-1) ─────────────
 
     def generate_slide_image(
-        self, slide: SlideScript, theme: str, title: str, output_path: Path
+        self, slide: SlideScript, theme: str, title: str, output_path: Path,
+        logo_data_url: str | None = None,
     ) -> Path:
         """Generate a single professional slide image using gpt-image-1."""
 
@@ -312,13 +337,31 @@ CRITICAL REQUIREMENTS:
 - NO watermarks, NO placeholder text, NO lorem ipsum
 - Match the clean, structured, infographic style of Google NotebookLM slides"""
 
-        response = _retry(lambda: self.client.images.generate(
-            model=Config.OPENAI_IMAGE_MODEL,
-            prompt=prompt,
-            size="1536x1024",
-            quality="high",
-            n=1,
-        ))
+        # For title slides with a logo, include the logo as a reference image
+        if logo_data_url and slide.slide_type == "title":
+            prompt += "\n\nIMPORTANT: Include the company logo (shown in the reference image) prominently on this title slide. Place it centered or top-center, with the title text below it."
+            response = _retry(lambda: self.client.images.edit(
+                model=Config.OPENAI_IMAGE_MODEL,
+                image=self._data_url_to_png_bytes(logo_data_url),
+                prompt=prompt,
+                size="1536x1024",
+            ))
+        elif logo_data_url and slide.slide_type != "title":
+            prompt += "\n\nInclude a small company logo watermark in the top-right corner of the slide (subtle, semi-transparent). The logo is shown in the reference image."
+            response = _retry(lambda: self.client.images.edit(
+                model=Config.OPENAI_IMAGE_MODEL,
+                image=self._data_url_to_png_bytes(logo_data_url),
+                prompt=prompt,
+                size="1536x1024",
+            ))
+        else:
+            response = _retry(lambda: self.client.images.generate(
+                model=Config.OPENAI_IMAGE_MODEL,
+                prompt=prompt,
+                size="1536x1024",
+                quality="high",
+                n=1,
+            ))
 
         img_b64 = response.data[0].b64_json
         img_bytes = base64.b64decode(img_b64)
@@ -330,8 +373,24 @@ CRITICAL REQUIREMENTS:
 
         return output_path
 
+    @staticmethod
+    def _data_url_to_png_bytes(data_url: str) -> bytes:
+        """Convert a data URL to raw PNG bytes for the images.edit API."""
+        # Strip the data:image/...;base64, prefix
+        if "," in data_url:
+            b64_data = data_url.split(",", 1)[1]
+        else:
+            b64_data = data_url
+        img_bytes = base64.b64decode(b64_data)
+        # Ensure it's PNG format
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
     def generate_all_slides(
-        self, script: PresentationScript, output_dir: Path
+        self, script: PresentationScript, output_dir: Path,
+        logo_data_url: str | None = None,
     ) -> list[Path]:
         """Generate all slide images in parallel."""
         console.print(f"[bold blue]🎨 Generating {len(script.slides)} slide images (parallel)...[/]")
@@ -339,7 +398,7 @@ CRITICAL REQUIREMENTS:
 
         def _gen_one(idx: int, slide: SlideScript) -> tuple[int, Path]:
             path = output_dir / f"slide_{slide.slide_number:03d}.png"
-            self.generate_slide_image(slide, script.theme, script.title, path)
+            self.generate_slide_image(slide, script.theme, script.title, path, logo_data_url)
             return idx, path
 
         max_workers = min(4, len(script.slides))
@@ -604,6 +663,8 @@ class PresentationPipeline:
         generate_video: bool = True,
         generate_pdf: bool = True,
         progress_callback=None,
+        images: list[Image.Image] | None = None,
+        image_labels: list[str] | None = None,
     ) -> PresentationResult:
         """
         Run the full presentation pipeline.
@@ -617,6 +678,8 @@ class PresentationPipeline:
             generate_video: Whether to generate MP4
             generate_pdf: Whether to generate PDF deck
             progress_callback: Optional callable(step: str, progress: float)
+            images: Optional list of PIL images (first one treated as logo)
+            image_labels: Optional labels for the images
 
         Returns:
             PresentationResult with paths to all outputs
@@ -651,13 +714,27 @@ class PresentationPipeline:
                 image_labels=[],
             )
 
+        # Extract logo from uploaded images (first image is treated as logo)
+        logo_image = None
+        logo_data_url = None
+        if images and len(images) > 0:
+            logo_image = images[0]
+            try:
+                logo_data_url = image_to_data_url(logo_image, max_size=1024)
+                logo_label = (image_labels[0] if image_labels else "logo")
+                console.print(f"  🏷️  Logo detected: {logo_label}")
+            except Exception as e:
+                console.print(f"  [yellow]⚠ Could not process logo: {e}[/]")
+                logo_image = None
+                logo_data_url = None
+
         console.print(f"[bold]Content: {content.title}[/]")
         console.print(f"  Sections: {content.total_sections} | Images: {content.image_count}")
 
         # ── Step 2: Plan Slides with AI ───────────────────
         _progress("Planning slides with AI...", 0.10)
         t0 = time.time()
-        script = self.generator.plan_slides(content)
+        script = self.generator.plan_slides(content, logo_image=logo_image)
         timings["Slide planning"] = time.time() - t0
         console.print(f"  ⏱️  Slide planning: {timings['Slide planning']:.1f}s")
 
@@ -670,7 +747,7 @@ class PresentationPipeline:
         with ThreadPoolExecutor(max_workers=2) as stage_pool:
             # Slide images and voiceover are independent — run concurrently
             slides_future = stage_pool.submit(
-                self.generator.generate_all_slides, script, work_dir,
+                self.generator.generate_all_slides, script, work_dir, logo_data_url,
             )
             voice_future = stage_pool.submit(
                 self.generator.generate_voiceover, script, work_dir, voice,

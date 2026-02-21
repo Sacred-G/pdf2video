@@ -79,6 +79,14 @@ def _run_pipeline_sync(
     if output_mode in ("presentation", "both"):
         from core.presentation import PresentationPipeline
 
+        # Load uploaded images (first one treated as logo for branding)
+        pil_images = []
+        for p in image_paths:
+            try:
+                pil_images.append(Image.open(p).convert("RGB"))
+            except Exception:
+                pass
+
         pres_pipeline = PresentationPipeline()
         result = pres_pipeline.run(
             pdf_path=pdf_path,
@@ -89,6 +97,8 @@ def _run_pipeline_sync(
             generate_video=True,
             generate_pdf=True,
             progress_callback=on_progress,
+            images=pil_images,
+            image_labels=image_labels,
         )
         # Return the video path (PDF is also saved in output_dir)
         return result.video_path or result.pdf_path
