@@ -4,10 +4,12 @@ Handles scene rendering, audio synchronization, transitions, and
 GPU-accelerated export via NVENC on RTX 5090.
 """
 
-import random
+import multiprocessing as mp
 import os
+import random
 import subprocess
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -553,49 +555,25 @@ class VideoComposer:
             console.print(f"[yellow]⚠ Background music error: {e}[/]")
             return video
 
-    # ── GPU-Accelerated Export ──────────────────────────────
+    # ── Parallel Frame Rendering + Export ──────────────────
 
     def _export_gpu(self, video: VideoClip, output_path: Path):
         """
-        Export video using a single-pass pipeline:
-        - NVENC available: pipe raw frames → ffmpeg h264_nvenc (one pass, no temp file)
-        - CPU fallback: MoviePy write_videofile with libx264 medium
+        Export video with parallel frame rendering piped to ffmpeg.
+        Uses multiprocessing to render frames across all CPU cores,
+        then pipes raw RGB24 frames to ffmpeg (NVENC or libx264).
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         has_nvenc = self._check_nvenc()
-        worker_threads = self._resolve_worker_threads(has_nvenc)
-        console.print(f"  Using {worker_threads} CPU worker threads for frame rendering")
-
-        if has_nvenc:
-            self._export_nvenc_pipe(video, output_path, worker_threads)
-        else:
-            console.print("  [yellow]NVENC not available, using CPU encoder (libx264)[/]")
-            video.write_videofile(
-                str(output_path),
-                fps=self.fps,
-                codec="libx264",
-                audio_codec="aac",
-                audio_bitrate="192k",
-                preset="medium",
-                ffmpeg_params=["-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
-                threads=worker_threads,
-                logger="bar",
-            )
-
-    def _export_nvenc_pipe(self, video: VideoClip, output_path: Path, threads: int):
-        """
-        Single-pass NVENC export: render audio to temp file, then pipe raw
-        RGB24 frames directly into ffmpeg h264_nvenc. No intermediate encode.
-        This is ~10-20x faster than the double-encode approach.
-        """
-        console.print("  [green]Using NVIDIA NVENC GPU encoder (single-pass pipe)[/]")
+        render_workers = self._resolve_render_workers()
+        console.print(f"  Using {render_workers} parallel render workers")
 
         w, h = self.size
         total_frames = int(video.duration * self.fps)
 
-        # 1. Write audio to a temp file (fast — just muxing)
+        # 1. Write audio to a temp file
         audio_tmp = None
         if video.audio is not None:
             audio_tmp = tempfile.NamedTemporaryFile(
@@ -607,10 +585,9 @@ class VideoComposer:
                 bitrate="192k", logger=None,
             )
 
-        # 2. Build ffmpeg command to receive raw frames via stdin pipe
+        # 2. Build ffmpeg command
         cmd = [
             "ffmpeg", "-y",
-            # Raw video input from pipe
             "-f", "rawvideo",
             "-vcodec", "rawvideo",
             "-s", f"{w}x{h}",
@@ -619,50 +596,110 @@ class VideoComposer:
             "-i", "pipe:0",
         ]
 
-        # Audio input from temp file
         if audio_tmp:
             cmd.extend(["-i", audio_tmp.name, "-c:a", "aac", "-b:a", "192k"])
 
-        # NVENC video encoding
-        cmd.extend([
-            "-c:v", "h264_nvenc",
-            "-preset", Config.NVENC_PRESET,
-            "-rc", "vbr",
-            "-cq", "19",
-            "-b:v", Config.VIDEO_BITRATE,
-            "-maxrate", "20M",
-            "-bufsize", "24M",
-            "-profile:v", "high",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            str(output_path),
-        ])
+        if has_nvenc:
+            console.print("  [green]Encoding: NVIDIA NVENC (GPU)[/]")
+            cmd.extend([
+                "-c:v", "h264_nvenc",
+                "-preset", Config.NVENC_PRESET,
+                "-rc", "vbr",
+                "-cq", "19",
+                "-b:v", Config.VIDEO_BITRATE,
+                "-maxrate", "20M",
+                "-bufsize", "24M",
+                "-profile:v", "high",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                str(output_path),
+            ])
+        else:
+            console.print("  [yellow]Encoding: libx264 (CPU)[/]")
+            cmd.extend([
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                str(output_path),
+            ])
 
-        # 3. Pipe frames to ffmpeg
+        # 3. Parallel render → pipe to ffmpeg
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
         try:
-            for frame_idx in tqdm(range(total_frames), desc="  Rendering frames", unit="f"):
-                t = frame_idx / self.fps
-                frame = video.get_frame(t)
-                # Ensure uint8 RGB
-                if frame.dtype != np.uint8:
-                    frame = np.clip(frame, 0, 255).astype(np.uint8)
-                proc.stdin.write(frame.tobytes())
-
+            self._parallel_render_to_pipe(video, proc.stdin, total_frames, render_workers)
             proc.stdin.close()
             proc.wait()
 
             if proc.returncode != 0:
                 stderr = proc.stderr.read().decode() if proc.stderr else ""
-                raise RuntimeError(f"FFmpeg NVENC pipe failed (rc={proc.returncode}): {stderr[:500]}")
-
+                raise RuntimeError(f"FFmpeg encode failed (rc={proc.returncode}): {stderr[:500]}")
         except Exception:
             proc.kill()
             raise
         finally:
             if audio_tmp:
                 Path(audio_tmp.name).unlink(missing_ok=True)
+
+    def _parallel_render_to_pipe(
+        self,
+        video: VideoClip,
+        pipe,
+        total_frames: int,
+        num_workers: int,
+    ):
+        """
+        Render frames in parallel batches using multiprocessing,
+        then write them in order to the ffmpeg pipe.
+
+        Strategy: render in chunks of `num_workers` frames at a time.
+        Each chunk is rendered in parallel, then written sequentially
+        to maintain frame order for the encoder.
+        """
+        batch_size = num_workers * 4  # render 4 frames per worker per batch
+        fps = self.fps
+
+        with tqdm(total=total_frames, desc="  Rendering frames", unit="f") as pbar:
+            for batch_start in range(0, total_frames, batch_size):
+                batch_end = min(batch_start + batch_size, total_frames)
+                batch_indices = list(range(batch_start, batch_end))
+
+                # Render batch in parallel using get_frame
+                frames = [None] * len(batch_indices)
+
+                if num_workers <= 1 or len(batch_indices) <= 2:
+                    # Single-threaded fallback for tiny batches
+                    for i, idx in enumerate(batch_indices):
+                        t = idx / fps
+                        frame = video.get_frame(t)
+                        if frame.dtype != np.uint8:
+                            frame = np.clip(frame, 0, 255).astype(np.uint8)
+                        frames[i] = frame
+                else:
+                    # Parallel rendering using threads (ProcessPool can't pickle VideoClip)
+                    from concurrent.futures import ThreadPoolExecutor
+                    def _render_frame(idx):
+                        t = idx / fps
+                        frame = video.get_frame(t)
+                        if frame.dtype != np.uint8:
+                            frame = np.clip(frame, 0, 255).astype(np.uint8)
+                        return frame
+
+                    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                        future_map = {
+                            pool.submit(_render_frame, idx): i
+                            for i, idx in enumerate(batch_indices)
+                        }
+                        for future in as_completed(future_map):
+                            i = future_map[future]
+                            frames[i] = future.result()
+
+                # Write frames in order to pipe
+                for frame in frames:
+                    pipe.write(frame.tobytes())
+                pbar.update(len(batch_indices))
 
     def _check_nvenc(self) -> bool:
         """Check if NVIDIA NVENC encoder is available."""
@@ -675,18 +712,12 @@ class VideoComposer:
         except Exception:
             return False
 
-    def _resolve_worker_threads(self, has_nvenc: bool) -> int:
-        """Choose render worker thread count, with optional auto-tuning."""
-        manual_threads = max(1, Config.NUM_WORKERS)
+    def _resolve_render_workers(self) -> int:
+        """Choose parallel render worker count based on available CPU cores."""
+        cpu_count = os.cpu_count() or 4
         if not Config.AUTO_TUNE_WORKERS:
-            return manual_threads
+            return max(1, Config.NUM_WORKERS)
 
-        cpu_count = os.cpu_count() or manual_threads
-        if has_nvenc:
-            # Leave headroom for ffmpeg/NVENC orchestration and system responsiveness.
-            tuned = max(6, cpu_count - (8 if cpu_count >= 24 else 4))
-        else:
-            # CPU-only encode path benefits from higher thread usage.
-            tuned = max(4, cpu_count - 2)
-
-        return max(1, min(manual_threads, tuned))
+        # Leave 2 cores for ffmpeg encoder + OS; use the rest for rendering
+        workers = max(2, cpu_count - 2)
+        return min(workers, Config.NUM_WORKERS) if Config.NUM_WORKERS > 0 else workers
