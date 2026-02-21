@@ -4,6 +4,7 @@ Coordinates PDF extraction → AI scripting → voiceover → video composition.
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
@@ -140,6 +141,7 @@ class PDF2VideoPipeline:
     ) -> Path:
         """Core pipeline shared by both PDF and text+images entry points."""
         start_time = time.time()
+        timings: dict[str, float] = {}
         output_path = Path(output_path)
 
         console.print(Panel(
@@ -155,21 +157,34 @@ class PDF2VideoPipeline:
             if progress_callback:
                 progress_callback(step, max(pct, progress_offset))
 
+        def _timed(label: str):
+            """Context manager that records elapsed time for a pipeline step."""
+            class _Timer:
+                def __enter__(self_):
+                    self_.t0 = time.time()
+                    return self_
+                def __exit__(self_, *args):
+                    timings[label] = time.time() - self_.t0
+                    console.print(f"  ⏱️  {label}: {timings[label]:.1f}s")
+            return _Timer()
+
         # ── Step 1: Classify Images (GPT-5.2 vision) ─────────
         if content.has_images and Config.IMAGE_CLASSIFICATION_ENABLED:
             _progress("Classifying images with AI vision...", 0.08)
-            classifications = self.classifier.classify_images(content.all_images)
-            for ci, cls_result in zip(content.all_images, classifications):
-                ci.classification = cls_result.classification
-                ci.description = cls_result.description
-                ci.has_data = cls_result.has_data
-                ci.is_comparison = cls_result.is_comparison
-                ci.visual_complexity = cls_result.visual_complexity
-                ci.suggested_hold_seconds = cls_result.suggested_hold_seconds
+            with _timed("Image classification"):
+                classifications = self.classifier.classify_images(content.all_images)
+                for ci, cls_result in zip(content.all_images, classifications):
+                    ci.classification = cls_result.classification
+                    ci.description = cls_result.description
+                    ci.has_data = cls_result.has_data
+                    ci.is_comparison = cls_result.is_comparison
+                    ci.visual_complexity = cls_result.visual_complexity
+                    ci.suggested_hold_seconds = cls_result.suggested_hold_seconds
 
         # ── Step 2: Generate AI Script (vision-powered) ──────
         _progress("Generating AI script...", 0.15)
-        script = self.ai.generate_script_from_content(content)
+        with _timed("Script generation"):
+            script = self.ai.generate_script_from_content(content)
 
         console.print(f"\n[bold]Script Overview:[/]")
         console.print(f"  Title: {script.title}")
@@ -181,38 +196,64 @@ class PDF2VideoPipeline:
             layout_info = f" [🖼️ {s.layout_mode}]" if s.layout_mode != "single" else ""
             console.print(f"  Scene {s.scene_number}: {s.narration[:50]}...{img_info}{bg_info}{layout_info}")
 
-        # ── Step 3: Generate Voiceover ──────────────────────
-        _progress("Generating AI voiceover...", 0.35)
-        audio_paths = self.ai.generate_voiceover(script, Config.TEMP_DIR, voice=voice)
-
-        # ── Step 4: Generate AI Backgrounds (only for gaps) ──
+        # ── Steps 3+4: Voiceover + Backgrounds (concurrent) ───
+        # These are independent — run them at the same time
+        _progress("Generating voiceover + backgrounds...", 0.35)
+        audio_paths = []
         ai_backgrounds = {}
-        if generate_backgrounds:
-            _progress("Generating AI backgrounds...", 0.50)
-            ai_backgrounds = self.ai.generate_scene_backgrounds(script, Config.TEMP_DIR)
+
+        with ThreadPoolExecutor(max_workers=2) as stage_pool:
+            voice_future = stage_pool.submit(
+                self.ai.generate_voiceover, script, Config.TEMP_DIR, voice,
+            )
+
+            bg_future = None
+            if generate_backgrounds:
+                bg_future = stage_pool.submit(
+                    self.ai.generate_scene_backgrounds, script, Config.TEMP_DIR,
+                )
+
+            # Collect results
+            t0 = time.time()
+            audio_paths = voice_future.result()
+            timings["Voiceover generation"] = time.time() - t0
+            console.print(f"  ⏱️  Voiceover generation: {timings['Voiceover generation']:.1f}s")
+
+            if bg_future is not None:
+                t1 = time.time()
+                ai_backgrounds = bg_future.result()
+                timings["Background generation"] = time.time() - t1
+                console.print(f"  ⏱️  Background generation: {timings['Background generation']:.1f}s")
+
+        wall_time = time.time() - (t0 if not bg_future else min(t0, t1))
+        console.print(f"  ⏱️  Voiceover + Backgrounds wall time: {time.time() - t0:.1f}s (concurrent)")
 
         # ── Step 5: Compose Video ───────────────────────────
         _progress("Composing video...", 0.65)
         bg_music_path = Path(background_music) if background_music else None
 
-        result = self.composer.compose(
-            script=script,
-            content=content,
-            audio_paths=audio_paths,
-            ai_backgrounds=ai_backgrounds,
-            output_path=output_path,
-            background_music_path=bg_music_path,
-        )
+        with _timed("Video composition + export"):
+            result = self.composer.compose(
+                script=script,
+                content=content,
+                audio_paths=audio_paths,
+                ai_backgrounds=ai_backgrounds,
+                output_path=output_path,
+                background_music_path=bg_music_path,
+            )
 
         # ── Done ────────────────────────────────────────────
         elapsed = time.time() - start_time
         _progress("Complete!", 1.0)
 
+        # Print timing breakdown
+        timing_lines = "\n".join(f"  {k}: {v:.1f}s" for k, v in timings.items())
         console.print(Panel(
             f"[bold green]✓ Video generated successfully![/]\n\n"
             f"📁 Output: {result}\n"
-            f"⏱️  Time: {elapsed:.1f}s\n"
-            f"🎬 Scenes: {len(script.scenes)}",
+            f"⏱️  Total: {elapsed:.1f}s\n"
+            f"🎬 Scenes: {len(script.scenes)}\n\n"
+            f"[bold]Timing Breakdown:[/]\n{timing_lines}",
             title="🎉 Complete",
             border_style="green",
         ))

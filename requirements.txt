@@ -29,6 +29,9 @@ sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
 alembic==1.14.1
 
+# ── Redis (job queue, progress pub/sub, caching) ───
+redis[hiredis]==5.2.1
+
 # ── Authentication ──────────────────────────────────
 PyJWT==2.10.1
 passlib[bcrypt]==1.7.4
@@ -37,9 +40,6 @@ email-validator==2.2.0
 # ── Configuration ───────────────────────────────────
 pydantic==2.10.4
 pydantic-settings==2.7.1
-
-# ── Legacy Web UI (Streamlit — will be retired) ─────
-streamlit==1.41.1
 
 # ── Utilities ───────────────────────────────────────
 python-dotenv==1.0.1

@@ -1,0 +1,92 @@
+# ── PDF2Video — Full Stack Docker Compose ────────────────────────────
+# One-command setup: docker compose up --build
+#
+# Services:
+#   postgres  — Database
+#   redis     — Job queue, progress pub/sub, caching
+#   backend   — FastAPI server (GPU-enabled for NVENC)
+#   frontend  — Next.js production build
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+  # ── PostgreSQL ───────────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pdf2video
+      POSTGRES_USER: pdf2video
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdf2video"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend (FastAPI + GPU) ──────────────────────────────────────
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pdf2video:${POSTGRES_PASSWORD:-password}@postgres:5432/pdf2video
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_LOCAL_PATH: /app/storage
+    volumes:
+      - storage_data:/app/storage
+      - output_data:/app/output
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Frontend (Next.js) ──────────────────────────────────────────
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../docker/Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_APP_NAME: PDF2Video
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
+  storage_data:
+  output_data:

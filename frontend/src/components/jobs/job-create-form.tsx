@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { ArrowRight, Loader2 } from "lucide-react";
+import { ArrowRight, Loader2, Save, FolderOpen } from "lucide-react";
 import { toast } from "sonner";
 
 import { fpsOptions, resolutions, voices } from "@/lib/constants";
@@ -11,7 +11,9 @@ import { PdfDropzone } from "@/components/upload/pdf-dropzone";
 import { ImageDropzone } from "@/components/upload/image-dropzone";
 import { MusicUpload } from "@/components/upload/music-upload";
 import { useUpload } from "@/hooks/use-upload";
+import { usePresets } from "@/hooks/use-presets";
 import { apiFetch } from "@/lib/api-client";
+import { Preset } from "@/types/preset";
 
 interface JobResponse {
   id: string;
@@ -26,8 +28,12 @@ const steps = ["Input", "Configure", "Review"] as const;
 export function JobCreateForm() {
   const router = useRouter();
   const { upload } = useUpload();
+  const { presets, defaultPreset, createPreset } = usePresets();
   const [step, setStep] = useState(0);
   const [submitting, setSubmitting] = useState(false);
+  const [savingPreset, setSavingPreset] = useState(false);
+  const [presetName, setPresetName] = useState("");
+  const [showSavePreset, setShowSavePreset] = useState(false);
 
   // Step 0 — Input
   const [pdfFile, setPdfFile] = useState<File | null>(null);
@@ -41,6 +47,45 @@ export function JobCreateForm() {
   const [fps, setFps] = useState(fpsOptions[1]); // 30
   const [generateBackgrounds, setGenerateBackgrounds] = useState(true);
   const [musicFile, setMusicFile] = useState<File | null>(null);
+
+  // Auto-load default preset on mount
+  useEffect(() => {
+    if (defaultPreset) {
+      applyPreset(defaultPreset);
+    }
+  }, [defaultPreset]);
+
+  function applyPreset(preset: Preset) {
+    const s = preset.settings;
+    if (s.voice && voices.includes(s.voice)) setVoice(s.voice);
+    if (s.resolution && resolutions.includes(s.resolution)) setResolution(s.resolution);
+    if (s.fps && fpsOptions.includes(s.fps)) setFps(s.fps);
+    if (typeof s.generate_backgrounds === "boolean") setGenerateBackgrounds(s.generate_backgrounds);
+    toast.success(`Loaded preset: ${preset.name}`);
+  }
+
+  async function handleSavePreset() {
+    if (!presetName.trim()) {
+      toast.error("Enter a preset name");
+      return;
+    }
+    setSavingPreset(true);
+    try {
+      await createPreset(presetName.trim(), "", {
+        voice,
+        resolution,
+        fps,
+        generate_backgrounds: generateBackgrounds,
+      });
+      toast.success(`Preset "${presetName}" saved`);
+      setShowSavePreset(false);
+      setPresetName("");
+    } catch {
+      toast.error("Failed to save preset");
+    } finally {
+      setSavingPreset(false);
+    }
+  }
 
   const sourceType = pdfFile ? "pdf" : "text_images";
   const hasInput = pdfFile || imageFiles.length > 0 || textContent.trim().length > 0;
@@ -137,23 +182,80 @@ export function JobCreateForm() {
         ) : null}
 
         {step === 1 ? (
-          <div className="grid gap-4 md:grid-cols-2">
-            <select value={voice} onChange={(e) => setVoice(e.target.value)} className="surface rounded-xl p-3">
-              {voices.map((v) => <option key={v} value={v}>{v}</option>)}
-            </select>
-            <select value={resolution} onChange={(e) => setResolution(e.target.value)} className="surface rounded-xl p-3">
-              {resolutions.map((r) => <option key={r} value={r}>{r}</option>)}
-            </select>
-            <select value={String(fps)} onChange={(e) => setFps(Number(e.target.value))} className="surface rounded-xl p-3">
-              {fpsOptions.map((f) => <option key={f} value={f}>{f} fps</option>)}
-            </select>
-            <label className="surface flex items-center gap-2 rounded-xl p-3 text-sm">
-              <input type="checkbox" checked={generateBackgrounds} onChange={(e) => setGenerateBackgrounds(e.target.checked)} />
-              Generate AI backgrounds
-            </label>
-            <div className="md:col-span-2">
-              <MusicUpload file={musicFile} onFileChange={setMusicFile} />
+          <div className="space-y-4">
+            {/* Preset selector */}
+            {presets.length > 0 && (
+              <div className="flex items-center gap-2">
+                <FolderOpen className="h-4 w-4 text-cyan-300" />
+                <select
+                  defaultValue=""
+                  onChange={(e) => {
+                    const preset = presets.find((p) => p.id === e.target.value);
+                    if (preset) applyPreset(preset);
+                  }}
+                  className="surface flex-1 rounded-xl p-3 text-sm"
+                >
+                  <option value="" disabled>Load a saved preset...</option>
+                  {presets.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}{p.is_default ? " (default)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <div className="grid gap-4 md:grid-cols-2">
+              <select value={voice} onChange={(e) => setVoice(e.target.value)} className="surface rounded-xl p-3">
+                {voices.map((v) => <option key={v} value={v}>{v}</option>)}
+              </select>
+              <select value={resolution} onChange={(e) => setResolution(e.target.value)} className="surface rounded-xl p-3">
+                {resolutions.map((r) => <option key={r} value={r}>{r}</option>)}
+              </select>
+              <select value={String(fps)} onChange={(e) => setFps(Number(e.target.value))} className="surface rounded-xl p-3">
+                {fpsOptions.map((f) => <option key={f} value={f}>{f} fps</option>)}
+              </select>
+              <label className="surface flex items-center gap-2 rounded-xl p-3 text-sm">
+                <input type="checkbox" checked={generateBackgrounds} onChange={(e) => setGenerateBackgrounds(e.target.checked)} />
+                Generate AI backgrounds
+              </label>
+              <div className="md:col-span-2">
+                <MusicUpload file={musicFile} onFileChange={setMusicFile} />
+              </div>
             </div>
+
+            {/* Save as preset */}
+            {showSavePreset ? (
+              <div className="flex items-center gap-2">
+                <input
+                  placeholder="Preset name"
+                  value={presetName}
+                  onChange={(e) => setPresetName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleSavePreset()}
+                  className="surface flex-1 rounded-xl p-3 text-sm outline-none"
+                  autoFocus
+                />
+                <button
+                  onClick={handleSavePreset}
+                  disabled={savingPreset}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-300/20 px-3 py-2 text-sm text-cyan-50"
+                >
+                  {savingPreset ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                  Save
+                </button>
+                <button onClick={() => setShowSavePreset(false)} className="text-xs text-cyan-100/50 hover:text-cyan-100">
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setShowSavePreset(true)}
+                className="inline-flex items-center gap-1.5 text-sm text-cyan-100/60 hover:text-cyan-50"
+              >
+                <Save className="h-3.5 w-3.5" />
+                Save current settings as preset
+              </button>
+            )}
           </div>
         ) : null}
 

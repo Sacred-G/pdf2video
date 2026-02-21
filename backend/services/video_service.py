@@ -1,5 +1,7 @@
 """Video service — create records, serve files, generate thumbnails."""
 
+import logging
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -8,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.video import Video
 from backend.utils.storage import LocalStorage
+
+logger = logging.getLogger(__name__)
 
 
 class VideoService:
@@ -26,8 +30,17 @@ class VideoService:
     ) -> Video:
         """Store a generated video file and create a DB record."""
         file_size = local_path.stat().st_size if local_path.exists() else 0
+
+        # Probe duration from the video file
+        if duration_seconds == 0.0 and local_path.exists():
+            duration_seconds = self._probe_duration(local_path)
+
         key = self.storage.generate_key(user_id, "videos", f"{title}.mp4")
         await self.storage.store(local_path, key)
+
+        # Generate thumbnail
+        thumb_key = key.rsplit(".", 1)[0] + "_thumb.jpg"
+        thumb_path = await self._generate_thumbnail(local_path, thumb_key)
 
         video = Video(
             user_id=user_id,
@@ -36,11 +49,48 @@ class VideoService:
             file_size=file_size,
             duration_seconds=duration_seconds,
             resolution=resolution,
+            thumbnail_path=thumb_path,
             metadata_json=metadata or {},
         )
         self.db.add(video)
         await self.db.flush()
         return video
+
+    def _probe_duration(self, video_path: Path) -> float:
+        """Use ffprobe to get video duration in seconds."""
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "quiet", "-show_entries",
+                    "format=duration", "-of", "csv=p=0", str(video_path),
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            return float(result.stdout.strip())
+        except Exception as e:
+            logger.warning("Failed to probe duration for %s: %s", video_path, e)
+            return 0.0
+
+    async def _generate_thumbnail(self, video_path: Path, thumb_key: str) -> str | None:
+        """Extract a frame at 2 seconds and store as thumbnail."""
+        try:
+            thumb_local = video_path.parent / f"{video_path.stem}_thumb.jpg"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(video_path),
+                    "-ss", "2", "-vframes", "1",
+                    "-vf", "scale=640:-1",
+                    "-q:v", "3", str(thumb_local),
+                ],
+                capture_output=True, timeout=15,
+            )
+            if thumb_local.exists():
+                await self.storage.store(thumb_local, thumb_key)
+                thumb_local.unlink(missing_ok=True)
+                return thumb_key
+        except Exception as e:
+            logger.warning("Failed to generate thumbnail: %s", e)
+        return None
 
     async def get_video(self, video_id: uuid.UUID, user_id: uuid.UUID) -> Video | None:
         result = await self.db.execute(

@@ -122,3 +122,44 @@ class JobService:
         job = result.scalar_one_or_none()
         if job:
             job.video_id = video_id
+
+    async def retry_job(self, job_id: uuid.UUID, user_id: uuid.UUID) -> Job | None:
+        """Clone a failed/cancelled job as a new pending job with the same settings."""
+        original = await self.get_job(job_id, user_id)
+        if not original:
+            return None
+        if original.status not in ("failed", "cancelled"):
+            return None
+
+        new_job = Job(
+            user_id=user_id,
+            source_type=original.source_type,
+            title=f"{original.title} (retry)",
+            text_content=original.text_content,
+            settings=original.settings,
+            status="pending",
+            current_step="Queued",
+        )
+        self.db.add(new_job)
+        await self.db.flush()
+
+        # Re-link the same uploads to the new job
+        from backend.models.upload import Upload
+        result = await self.db.execute(
+            select(Upload).where(Upload.job_id == job_id)
+        )
+        for upload in result.scalars():
+            # Create a reference — uploads can be shared
+            new_upload = Upload(
+                user_id=user_id,
+                job_id=new_job.id,
+                file_type=upload.file_type,
+                original_filename=upload.original_filename,
+                stored_path=upload.stored_path,
+                file_size=upload.file_size,
+                mime_type=upload.mime_type,
+            )
+            self.db.add(new_upload)
+
+        await self.db.flush()
+        return new_job

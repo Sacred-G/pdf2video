@@ -29,3 +29,4 @@ class User(Base):
     jobs = relationship("Job", back_populates="user", lazy="selectin")
     videos = relationship("Video", back_populates="user", lazy="selectin")
     uploads = relationship("Upload", back_populates="user", lazy="selectin")
+    presets = relationship("Preset", back_populates="user", lazy="selectin")

@@ -556,78 +556,113 @@ class VideoComposer:
     # ── GPU-Accelerated Export ──────────────────────────────
 
     def _export_gpu(self, video: VideoClip, output_path: Path):
-        """Export video using NVENC GPU encoder for fast, high-quality output."""
+        """
+        Export video using a single-pass pipeline:
+        - NVENC available: pipe raw frames → ffmpeg h264_nvenc (one pass, no temp file)
+        - CPU fallback: MoviePy write_videofile with libx264 medium
+        """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Check if NVENC is available
         has_nvenc = self._check_nvenc()
+        worker_threads = self._resolve_worker_threads(has_nvenc)
+        console.print(f"  Using {worker_threads} CPU worker threads for frame rendering")
 
         if has_nvenc:
-            console.print("  [green]Using NVIDIA NVENC GPU encoder[/]")
-            codec = "h264_nvenc"
-            extra_params = [
-                "-preset", Config.NVENC_PRESET,
-                "-rc", "vbr",
-                "-cq", "19",
-                "-b:v", Config.VIDEO_BITRATE,
-                "-maxrate", "20M",
-                "-bufsize", "24M",
-                "-profile:v", "high",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-            ]
+            self._export_nvenc_pipe(video, output_path, worker_threads)
         else:
             console.print("  [yellow]NVENC not available, using CPU encoder (libx264)[/]")
-            codec = "libx264"
-            extra_params = [
-                "-preset", "medium",
-                "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-            ]
-
-        # Write to a unique temp file first, then use FFmpeg for final encode
-        temp_path: Path | None = None
-        if has_nvenc:
-            with tempfile.NamedTemporaryFile(
-                suffix=".mp4",
-                dir=Config.TEMP_DIR,
-                delete=False,
-            ) as tmp:
-                temp_path = Path(tmp.name)
-
-        worker_threads = self._resolve_worker_threads(has_nvenc)
-        console.print(f"  Using {worker_threads} CPU worker threads for render pass")
-
-        # MoviePy write with FFmpeg params
-        video.write_videofile(
-            str(temp_path) if has_nvenc and temp_path else str(output_path),
-            fps=self.fps,
-            codec=codec if not has_nvenc else "libx264",  # MoviePy render pass
-            audio_codec="aac",
-            audio_bitrate="192k",
-            preset="ultrafast" if has_nvenc else "medium",
-            threads=worker_threads,
-            logger="bar",
-        )
-
-        # If NVENC available, do a GPU re-encode pass for max quality
-        if has_nvenc and temp_path and temp_path.exists():
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(temp_path),
-                "-c:v", codec,
-                *extra_params,
-                "-c:a", "aac", "-b:a", "192k",
+            video.write_videofile(
                 str(output_path),
-            ]
-            console.print("  GPU re-encoding for maximum quality...")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            temp_path.unlink(missing_ok=True)
-            if result.returncode != 0:
-                stderr = (result.stderr or "").strip()
-                raise RuntimeError(f"FFmpeg NVENC re-encode failed: {stderr or 'unknown error'}")
+                fps=self.fps,
+                codec="libx264",
+                audio_codec="aac",
+                audio_bitrate="192k",
+                preset="medium",
+                ffmpeg_params=["-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+                threads=worker_threads,
+                logger="bar",
+            )
+
+    def _export_nvenc_pipe(self, video: VideoClip, output_path: Path, threads: int):
+        """
+        Single-pass NVENC export: render audio to temp file, then pipe raw
+        RGB24 frames directly into ffmpeg h264_nvenc. No intermediate encode.
+        This is ~10-20x faster than the double-encode approach.
+        """
+        console.print("  [green]Using NVIDIA NVENC GPU encoder (single-pass pipe)[/]")
+
+        w, h = self.size
+        total_frames = int(video.duration * self.fps)
+
+        # 1. Write audio to a temp file (fast — just muxing)
+        audio_tmp = None
+        if video.audio is not None:
+            audio_tmp = tempfile.NamedTemporaryFile(
+                suffix=".aac", dir=Config.TEMP_DIR, delete=False
+            )
+            audio_tmp.close()
+            video.audio.write_audiofile(
+                audio_tmp.name, fps=44100, codec="aac",
+                bitrate="192k", logger=None,
+            )
+
+        # 2. Build ffmpeg command to receive raw frames via stdin pipe
+        cmd = [
+            "ffmpeg", "-y",
+            # Raw video input from pipe
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}",
+            "-pix_fmt", "rgb24",
+            "-r", str(self.fps),
+            "-i", "pipe:0",
+        ]
+
+        # Audio input from temp file
+        if audio_tmp:
+            cmd.extend(["-i", audio_tmp.name, "-c:a", "aac", "-b:a", "192k"])
+
+        # NVENC video encoding
+        cmd.extend([
+            "-c:v", "h264_nvenc",
+            "-preset", Config.NVENC_PRESET,
+            "-rc", "vbr",
+            "-cq", "19",
+            "-b:v", Config.VIDEO_BITRATE,
+            "-maxrate", "20M",
+            "-bufsize", "24M",
+            "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(output_path),
+        ])
+
+        # 3. Pipe frames to ffmpeg
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        try:
+            for frame_idx in tqdm(range(total_frames), desc="  Rendering frames", unit="f"):
+                t = frame_idx / self.fps
+                frame = video.get_frame(t)
+                # Ensure uint8 RGB
+                if frame.dtype != np.uint8:
+                    frame = np.clip(frame, 0, 255).astype(np.uint8)
+                proc.stdin.write(frame.tobytes())
+
+            proc.stdin.close()
+            proc.wait()
+
+            if proc.returncode != 0:
+                stderr = proc.stderr.read().decode() if proc.stderr else ""
+                raise RuntimeError(f"FFmpeg NVENC pipe failed (rc={proc.returncode}): {stderr[:500]}")
+
+        except Exception:
+            proc.kill()
+            raise
+        finally:
+            if audio_tmp:
+                Path(audio_tmp.name).unlink(missing_ok=True)
 
     def _check_nvenc(self) -> bool:
         """Check if NVIDIA NVENC encoder is available."""

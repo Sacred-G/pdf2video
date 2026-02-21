@@ -1,0 +1,49 @@
+# ── PDF2Video — Development Overrides ────────────────────────────────
+# Usage: docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up
+#
+# Adds hot-reload volumes and dev-mode settings.
+# Only starts infrastructure (postgres + redis) — run backend/frontend locally.
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+  # ── Infrastructure only — backend/frontend run locally ───────────
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  # ── Backend with hot reload ──────────────────────────────────────
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    command: ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ../core:/app/core
+      - ../backend:/app/backend
+      - storage_data:/app/storage
+      - output_data:/app/output
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pdf2video:password@postgres:5432/pdf2video
+      REDIS_URL: redis://redis:6379/0
+
+  # ── Frontend with hot reload ─────────────────────────────────────
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    command: ["npm", "run", "dev"]
+    volumes:
+      - ../frontend/src:/app/src
+      - ../frontend/public:/app/public
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+
+volumes:
+  postgres_data:
+  redis_data:
+  storage_data:
+  output_data:

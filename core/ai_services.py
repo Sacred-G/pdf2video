@@ -8,6 +8,7 @@ import io
 import json
 import time
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dataclasses import dataclass, field
 from openai import OpenAI, APITimeoutError, APIConnectionError, RateLimitError
@@ -396,25 +397,33 @@ Return ONLY valid JSON, no markdown formatting."""
         output_dir: Path,
         voice: str | None = None,
     ) -> list[Path]:
-        """Generate individual voiceover clips for each scene."""
-        console.print("[bold blue]🎙️  Generating AI voiceover...[/]")
-        audio_paths = []
+        """Generate individual voiceover clips for each scene — in parallel."""
+        console.print("[bold blue]🎙️  Generating AI voiceover (parallel)...[/]")
         selected_voice = voice or Config.OPENAI_TTS_VOICE
+        audio_paths: list[Path | None] = [None] * len(script.scenes)
 
-        for scene in script.scenes:
+        def _generate_one(idx: int, scene: SceneScript) -> tuple[int, Path]:
             audio_path = output_dir / f"scene_{scene.scene_number:03d}_voice.mp3"
-            console.print(f"  Scene {scene.scene_number}: generating audio...")
-
-            response = _retry(lambda scene=scene: self.client.audio.speech.create(
+            response = _retry(lambda: self.client.audio.speech.create(
                 model=Config.OPENAI_TTS_MODEL,
                 voice=selected_voice,
                 input=scene.narration,
                 response_format="mp3",
-                speed=0.95,  # slightly slower for documentary feel
+                speed=0.95,
             ))
-
             response.stream_to_file(str(audio_path))
-            audio_paths.append(audio_path)
+            return idx, audio_path
+
+        max_workers = min(8, len(script.scenes))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_generate_one, i, scene): i
+                for i, scene in enumerate(script.scenes)
+            }
+            for future in as_completed(futures):
+                idx, path = future.result()
+                audio_paths[idx] = path
+                console.print(f"  Scene {idx + 1}: audio ready")
 
         console.print(f"[bold green]✓[/] Generated {len(audio_paths)} audio clips")
         return audio_paths
@@ -448,18 +457,33 @@ Return ONLY valid JSON, no markdown formatting."""
     def generate_scene_backgrounds(
         self, script: VideoScript, output_dir: Path
     ) -> dict[int, Path]:
-        """Generate AI backgrounds for scenes that need them."""
-        console.print("[bold blue]🎨 Generating AI backgrounds...[/]")
+        """Generate AI backgrounds for scenes that need them — in parallel."""
+        scenes_needing_bg = [
+            s for s in script.scenes if s.generate_background and s.background_prompt
+        ]
+        if not scenes_needing_bg:
+            return {}
+
+        console.print(f"[bold blue]🎨 Generating {len(scenes_needing_bg)} AI backgrounds (parallel)...[/]")
         backgrounds = {}
 
-        for scene in script.scenes:
-            if scene.generate_background and scene.background_prompt:
-                bg_path = output_dir / f"scene_{scene.scene_number:03d}_bg.png"
-                try:
-                    self.generate_background_image(scene.background_prompt, bg_path)
-                    backgrounds[scene.scene_number] = bg_path
-                except Exception as e:
-                    console.print(f"  [yellow]⚠ Background gen failed for scene {scene.scene_number}: {e}[/]")
+        def _generate_one(scene: SceneScript) -> tuple[int, Path | None]:
+            bg_path = output_dir / f"scene_{scene.scene_number:03d}_bg.png"
+            try:
+                self.generate_background_image(scene.background_prompt, bg_path)
+                return scene.scene_number, bg_path
+            except Exception as e:
+                console.print(f"  [yellow]⚠ Background gen failed for scene {scene.scene_number}: {e}[/]")
+                return scene.scene_number, None
+
+        max_workers = min(4, len(scenes_needing_bg))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_generate_one, s) for s in scenes_needing_bg]
+            for future in as_completed(futures):
+                scene_num, path = future.result()
+                if path:
+                    backgrounds[scene_num] = path
+                    console.print(f"  Scene {scene_num}: background ready")
 
         console.print(f"[bold green]✓[/] Generated {len(backgrounds)} backgrounds")
         return backgrounds
